@@ -1,8 +1,8 @@
 """End-to-end pipeline:
     1. Simulate true 4-body solar-system dynamics with diffrax, generate noisy
        observations, hold out 25 % as test.
-    2. Fit the physics model (Bayesian, with priors on G, masses, ICs) via SVI
-       with a multivariate-Normal guide.
+    2. Fit the physics model (Bayesian, priors on G/masses/sigma; ICs fixed
+       at known) by L-BFGS MAP and then SVI with a multivariate-Normal guide.
     3. Fit a per-planet Fourier basis-function regression in closed form.
     4. Compute log p(y_test | y_train) for both models and compare.
 """
@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 
 from simulate import make_train_test, simulate
 from physics_model import (
-    run_svi, predictive_loglik_physics,
+    run_map, run_svi, predictive_loglik_physics,
     INIT_KNOWN, LOG_M_KNOWN, LOG_G_KNOWN,
 )
 from fourier_model import fourier_predictive_logpy_test, optimise_tau
@@ -29,24 +29,38 @@ from constants import PLANETS
 CACHE_PATH = "/home/frans/htv/svi_samples.pkl"
 
 
-def run_or_load_svi(ts_train, obs_train, num_steps=2000, num_post_samples=400, force=False):
+def run_or_load_physics(ts_train, obs_train, svi_steps=1500,
+                        num_post_samples=200, force=False):
     if not force and os.path.exists(CACHE_PATH):
         print(f"loading cached SVI samples from {CACHE_PATH}")
         with open(CACHE_PATH, "rb") as f:
             return pickle.load(f)
 
-    print(f"running SVI: num_steps={num_steps}, num_post_samples={num_post_samples}")
+    print("running MAP via L-BFGS")
+    t0 = time.time()
+    map_result, map_values = run_map(ts_train, obs_train)
+    print(f"MAP done in {time.time()-t0:.1f}s; iters={map_result.nit}, "
+          f"loss={float(map_result.fun):.4f}, |grad|_inf={float(np.max(np.abs(map_result.jac))):.2e}")
+
+    print(f"running SVI from MAP: num_steps={svi_steps}, num_post_samples={num_post_samples}")
     t0 = time.time()
     svi_result, guide, samples = run_svi(
-        ts_train, obs_train, num_steps=num_steps,
-        num_post_samples=num_post_samples, progress=False,
+        ts_train, obs_train, init_values=map_values,
+        num_steps=svi_steps, num_post_samples=num_post_samples, progress=False,
     )
     elapsed = time.time() - t0
     samples = {k: np.asarray(v) for k, v in samples.items()}
-    losses = np.asarray(svi_result.losses)
-    print(f"SVI done in {elapsed:.1f}s; final ELBO loss = {float(losses[-1]):.1f}")
+    svi_losses = np.asarray(svi_result.losses)
+    print(f"SVI done in {elapsed:.1f}s; ELBO loss {float(svi_losses[0]):.1f} -> {float(svi_losses[-1]):.1f}")
 
-    out = dict(samples=samples, losses=losses, elapsed=elapsed)
+    out = dict(
+        samples=samples,
+        svi_losses=svi_losses,
+        map_loss=float(map_result.fun),
+        map_iters=int(map_result.nit),
+        map_values={k: np.asarray(v) for k, v in map_values.items()},
+        elapsed=elapsed,
+    )
     with open(CACHE_PATH, "wb") as f:
         pickle.dump(out, f)
     print(f"cached SVI samples to {CACHE_PATH}")
@@ -57,9 +71,9 @@ def main():
     ts_train, obs_train, ts_test, obs_test, traj_true = make_train_test(seed=0)
     print(f"data: train {ts_train.shape}, test {ts_test.shape}")
 
-    # ---------- Physics: SVI on train ----------
-    print("\n=== Physics SVI (multivariate-Normal guide) ===")
-    svi_out = run_or_load_svi(ts_train, obs_train)
+    # ---------- Physics: MAP then SVI on train ----------
+    print("\n=== Physics MAP -> SVI (multivariate-Normal guide) ===")
+    svi_out = run_or_load_physics(ts_train, obs_train)
     samples = svi_out["samples"]
 
     # posterior summary
@@ -70,10 +84,6 @@ def main():
         m = samples['log_M'][:, i]
         print(f"  log_M[{name:7s}]: {m.mean():+.4f} +/- {m.std():.4f}  (true {log_M_true[i]:+.4f})")
     print(f"  log_sigma: {samples['log_sigma'].mean():+.4f} +/- {samples['log_sigma'].std():.4f}  (true {np.log(0.005):+.4f})")
-    init_mean = samples['init'].mean(axis=0)
-    init_true = np.asarray(INIT_KNOWN)
-    init_err = np.max(np.abs(init_mean - init_true))
-    print(f"  max |init mean - true|: {init_err:.4f}")
 
     # ---------- Physics: predictive on test ----------
     print("\nevaluating physics posterior predictive on test...")
@@ -113,12 +123,11 @@ def main():
     # ---------- Plots ----------
     G_post = float(np.exp(samples['log_G'].mean()))
     M_post = np.exp(samples['log_M'].mean(axis=0))
-    init_post = samples['init'].mean(axis=0)
     ts_full = jnp.concatenate([ts_train, ts_test])
     sort_idx = jnp.argsort(ts_full)
     ts_sorted = ts_full[sort_idx]
     traj_post = np.asarray(simulate(jnp.float64(G_post), jnp.asarray(M_post),
-                                    jnp.asarray(init_post), ts_sorted))
+                                    INIT_KNOWN, ts_sorted, t0=0.0))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
     colors = ["tab:gray", "gold", "tab:blue", "tab:red"]

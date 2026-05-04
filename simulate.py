@@ -38,14 +38,21 @@ def nbody_rhs(t, y, args):
 
 
 @partial(jax.jit, static_argnames=("max_steps",))
-def simulate(G, masses, init_state, ts, max_steps=20_000):
+def simulate(G, masses, init_state, ts, t0=None, max_steps=20_000):
+    """Integrate the N-body ODE from `t0` (default ts[0]) up to ts[-1] and
+    save at the times in `ts`. `init_state` is the state at `t0`, so when
+    inferring on a slice of times that does not start at 0, callers should
+    pass `t0=0.0` so the known initial condition is interpreted correctly.
+    """
+    if t0 is None:
+        t0 = ts[0]
     term = diffrax.ODETerm(nbody_rhs)
     solver = diffrax.Tsit5()
     controller = diffrax.PIDController(rtol=1e-7, atol=1e-9)
     sol = diffrax.diffeqsolve(
         term,
         solver,
-        t0=ts[0],
+        t0=t0,
         t1=ts[-1],
         dt0=0.005,
         y0=init_state,
